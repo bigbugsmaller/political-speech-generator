@@ -42,8 +42,7 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# API keys and secrets
-config.py
+# API keys and secrets (.env only — config.py is tracked, no secrets)
 .env
 
 # Database

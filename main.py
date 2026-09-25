@@ -308,8 +308,10 @@ test_cases = [
     },
 ]
 
-# for test in test_cases:
-#     response = generate_response(test)
-#     print("Generated Response:", response)
+if __name__ == "__main__":
+    # for test in test_cases:
+    #     response = generate_response(test)
+    #     print("Generated Response:", response)
 
-response = generate_response(test_cases[6])
+    response = generate_response(test_cases[6])
+    print("Generated Response:", response)

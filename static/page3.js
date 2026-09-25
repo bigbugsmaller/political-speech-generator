@@ -20,10 +20,20 @@ document.addEventListener("DOMContentLoaded", function() {
     // Combine all data into one object.
     const combinedData = Object.assign({}, page1Data, page2Data, page3Data, { page: "page3" });
     
-    // Send the combined data to the Flask server's /process endpoint.
+    // Send the combined data to the Flask server's /process endpoint (JWT required).
+    const token = (typeof getAuthToken === "function" ? getAuthToken() : null)
+      || localStorage.getItem("authToken");
+    if (!token) {
+      alert("Please log in first.");
+      window.location.href = "/login";
+      return;
+    }
     fetch('/process', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
       body: JSON.stringify(combinedData)
     })
     .then(response => response.json())

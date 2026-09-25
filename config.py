@@ -1,9 +1,60 @@
-DB_PATH = "./data/lancedb"
-SERPER_API_KEY = "8c7da3371344a1e17f798c884aa504c399498b68"
-SERPER_API_HOST = "google.serper.dev"
-OPENAI_API = "aMn5STDhSBDorVIhh8u5DalCUceRniQg"
-MODEL_URL = "https://api.deepinfra.com/v1/openai"
-MODEL = "deepseek-ai/DeepSeek-V3"
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _require_env(key: str) -> str:
+    value = os.environ.get(key)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return value
+
+
+# LanceDB vector store path (separate from Postgres DATABASE_URL used in db.py).
+LANCEDB_URL = os.environ.get("LANCEDB_URL") or os.environ.get("LANCEDB_PATH")
+if not LANCEDB_URL:
+    # Back-compat: old installs put the LanceDB path in DATABASE_URL.
+    _maybe_lancedb = os.environ.get("DATABASE_URL", "./data/lancedb")
+    if _maybe_lancedb and not _maybe_lancedb.startswith(("postgresql", "postgres")):
+        LANCEDB_URL = _maybe_lancedb
+    else:
+        LANCEDB_URL = "./data/lancedb"
+DB_PATH = LANCEDB_URL
+
+# LLM provider switch (OpenAI-compatible clients only).
+# llm.py keeps using OPENAI_API + MODEL_URL + MODEL regardless of provider.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepinfra").strip().lower()
+
+if LLM_PROVIDER == "groq":
+    OPENAI_API = _require_env("GROQ_API_KEY").strip()
+    MODEL_URL = os.environ.get(
+        "GROQ_MODEL_URL", "https://api.groq.com/openai/v1"
+    ).strip()
+    MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+elif LLM_PROVIDER == "openrouter":
+    OPENAI_API = _require_env("OPENROUTER_API_KEY").strip()
+    MODEL_URL = os.environ.get(
+        "OPENROUTER_MODEL_URL", "https://openrouter.ai/api/v1"
+    ).strip()
+    MODEL = os.environ.get(
+        "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+    ).strip()
+elif LLM_PROVIDER in ("deepinfra", "openai"):
+    OPENAI_API = _require_env("OPENAI_API").strip()
+    MODEL_URL = os.environ.get(
+        "MODEL_URL", "https://api.deepinfra.com/v1/openai"
+    ).strip()
+    MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V3").strip()
+else:
+    raise RuntimeError(
+        f"Unsupported LLM_PROVIDER={LLM_PROVIDER!r}. "
+        "Use 'groq', 'openrouter', or 'deepinfra'."
+    )
+
+SERPER_API_KEY = _require_env("SERPER_API_KEY")
+SERPER_API_HOST = os.environ.get("SERPER_API_HOST", "google.serper.dev")
 
 TEMPLATE = """
     candidate-name: {candidate-name}  
@@ -48,6 +99,34 @@ SYSTEMPROMPT = """
     You are a skilled political speech writer tasked with creating a personalized, compelling speech for
     a political candidate. Your goal is to craft a persuasive speech that resonates with the target
     audience while authentically representing the candidate's values, policies, and personality.
+
+    ## Tool-Calling Capability (IMPORTANT)
+
+    You have access to tools. Use them to gather and verify context BEFORE writing the final speech.
+
+    Available tools:
+    1. search_vector_db(query) — Search the local LanceDB knowledge base for relevant background
+       about the candidate, party, location, policies, or recent events. Prefer this first.
+    2. search_web(query) — Search the live web (Serper) and scrape page text when the vector DB
+       lacks enough useful context. Use for fresh/local facts.
+    3. fact_check_claim(claim) — Verify a specific statistic, date, policy figure, or factual claim
+       you are about to include. Returns supporting evidence, contradicting evidence, or unverified.
+
+    Tool budget:
+    - Call at most ONE tool per turn. After seeing that tool's result, decide whether
+      you have enough information to write the final speech, or whether you need to
+      call one more tool. Do not request multiple tools at once.
+    - You may make at most 3 tool calls total across all tools for one speech.
+    - You do NOT need to use all 3 calls. If vector DB results are already sufficient,
+      skip search_web and/or fact_check_claim and write the final speech.
+    - Prefer search_vector_db first; use search_web only when vector results are thin;
+      use fact_check_claim only for a specific statistic/date/policy figure you will state.
+    - Always search for context before drafting. Do not skip tools and jump straight to the speech
+      unless tools have already returned enough information in this conversation.
+    - Do not invent statistics or local facts when tools can check them.
+    - After gathering enough context (or when the tool budget is exhausted), you MUST produce the
+      final structured JSON output (speech, key_themes, sentiment) and stop calling tools.
+    - If a tool fails, continue with whatever context you already have; do not invent tool results.
 
     ## Speech Creation Process
 
@@ -525,3 +604,109 @@ output:
         }
     }
 """
+
+# Groq free-tier TPM is small; drop the giant few-shot examples so tool calls fit.
+# DeepInfra keeps the full few-shot SYSTEMPROMPT above.
+if LLM_PROVIDER == "groq":
+    SYSTEMPROMPT = """
+You are a skilled political speech writer. Create a personalized, compelling first-person
+campaign speech from the provided candidate fields and any tool-retrieved context.
+
+## Tool-Calling Capability (IMPORTANT)
+You have tools. Use them to gather/verify context BEFORE writing the final speech.
+1. search_vector_db(query) — local LanceDB background (prefer first)
+2. search_web(query) — live web via Serper when vector DB is thin
+3. fact_check_claim(claim) — verify a specific statistic/date/policy figure
+   (returns supporting, contradicting, or unverified)
+
+Tool budget:
+- Call at most ONE tool per turn. After seeing that tool's result, decide whether you
+  have enough information to write the final speech, or whether you need to call one
+  more tool. Do not request multiple tools at once.
+- At most 3 tool calls total. You do NOT need all 3 — stop early when you have enough.
+- Prefer search_vector_db first; skip search_web if vector results suffice; use
+  fact_check_claim only for a specific statistic/date/policy figure you will state.
+- Do not invent statistics when tools can check them.
+- After tools (or if a tool fails), produce the final JSON and stop calling tools.
+- Use the provider's native function-calling format only (do not emit XML-like <function> tags).
+
+## Speech rules
+- Write in first person as the candidate; no meta-commentary.
+- Match tone, language-dialect, speech-length, slogan, CTA, and policy points from the user data.
+- Minimum ~500 words for a 5-minute speech; scale with speech-length.
+- Do not invent hypothetical personal stories beyond provided context/tool evidence.
+
+## Final output (JSON only)
+{
+  "speech": "full speech text",
+  "key_themes": ["theme1", "theme2", "theme3"],
+  "sentiment": {
+    "category": "e.g. inspirational",
+    "explanation": "brief reason"
+  }
+}
+"""
+
+# Output token budget (Groq free tier is tight; DeepInfra can be larger).
+MAX_OUTPUT_TOKENS = 2048 if LLM_PROVIDER == "groq" else 16000
+
+# --- Eval / test agent mode (smaller prompts; production /process unchanged) ---
+# Enable via AGENT_EVAL_MODE=1 or test_agent.py --eval
+AGENT_EVAL_MODE = os.environ.get("AGENT_EVAL_MODE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+EVAL_MAX_TOOL_RESULT_CHARS = int(
+    os.environ.get("EVAL_MAX_TOOL_RESULT_CHARS", "1200")
+)
+
+_agent_eval_session = False
+
+
+def set_agent_eval_mode(enabled: bool) -> None:
+    """Toggle eval prompts/tool truncation for the current process (e.g. test_agent)."""
+    global _agent_eval_session
+    _agent_eval_session = enabled
+
+
+def is_agent_eval_mode() -> bool:
+    return _agent_eval_session or AGENT_EVAL_MODE
+
+
+EVAL_SYSTEMPROMPT = """
+You write first-person political campaign speeches from the candidate fields provided.
+Tools (optional): search_vector_db(query), search_web(query), fact_check_claim(claim).
+Rules: at most ONE tool per turn; max 3 tools total; stop early if you have enough context.
+Do not invent statistics. When done, return ONLY JSON:
+{"speech":"...","key_themes":["..."],"sentiment":{"category":"...","explanation":"..."}}
+"""
+
+EVAL_TEMPLATE = """
+candidate-name: {candidate-name}
+political-party: {political-party}
+geographic-location: {geographic-location}
+speech-length: {speech-length}
+slogan: {slogan}
+main-message: {main-message}
+policy-points: {policy-points}
+key-messages: {key-messages}
+tone: {tone}
+retrieved_info: {retrieved_info}
+"""
+
+EVAL_USER_PREAMBLE = (
+    "Gather context with tools only if needed (one tool per turn, max 3). "
+    "Then return the final speech JSON.\n"
+    "Start query hint: {candidate} {party} {location}\n\n"
+)
+
+
+def resolve_system_prompt(*, eval_mode: bool | None = None) -> str:
+    use_eval = is_agent_eval_mode() if eval_mode is None else eval_mode
+    return EVAL_SYSTEMPROMPT if use_eval else SYSTEMPROMPT
+
+
+def resolve_user_template(*, eval_mode: bool | None = None) -> str:
+    use_eval = is_agent_eval_mode() if eval_mode is None else eval_mode
+    return EVAL_TEMPLATE if use_eval else TEMPLATE

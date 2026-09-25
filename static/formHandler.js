@@ -1,4 +1,27 @@
 
+/**
+ * JWT from login.html (window.authToken) or localStorage fallback.
+ * Kept as a module-level JS variable so /process can send Authorization: Bearer …
+ */
+let authToken = window.authToken || localStorage.getItem("authToken") || null;
+
+function getAuthToken() {
+  return authToken || window.authToken || localStorage.getItem("authToken") || null;
+}
+
+function setAuthToken(token) {
+  authToken = token;
+  window.authToken = token;
+  if (token) localStorage.setItem("authToken", token);
+  else localStorage.removeItem("authToken");
+}
+
+function authHeaders(extra) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, extra || {});
+  const token = getAuthToken();
+  if (token) headers["Authorization"] = "Bearer " + token;
+  return headers;
+}
 
 /**
  * Returns an object with values from all input, textarea, and select fields (using element IDs as keys)
@@ -158,14 +181,29 @@ let cachedResponse = null;
         return;
     }
 
-    // Otherwise, fetch new data from the API
+    // Otherwise, fetch new data from the API (JWT required).
+    if (!getAuthToken()) {
+        alert("Please log in first.");
+        window.location.href = "/login";
+        return;
+    }
+
     fetch('/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(combinedData)
     })
-    .then(response => response.json())
+    .then(response => {
+        if (response.status === 401) {
+            alert("Session expired. Please log in again.");
+            setAuthToken(null);
+            window.location.href = "/login";
+            return null;
+        }
+        return response.json();
+    })
     .then(data => {
+        if (!data) return;
         // Check if the response contains error and message keys
         if (data.error && data.message) {
             // Display error alert with code and message
